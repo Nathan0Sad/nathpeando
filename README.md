@@ -1,8 +1,8 @@
 # Nathpeando (`mando`)
 
-Herramienta de terminal para **conectar, reconectar, inspeccionar y probar mandos Bluetooth** en Linux. No es un daemon: se ejecuta cuando la llamas, hace su trabajo y termina. Su principio es no destruir nada: **no borra emparejamientos** ni usa `disconnect`, `remove`, `unpair` o `block`.
+Herramienta de terminal para **conectar, reconectar, inspeccionar, probar mandos y arreglar funcionamiento de mandos para su uso por bluetooth** en Linux.
 
-La interfaz se llama **Nathpeando** y el ejecutable sigue siendo `mando`, versión **1.2.1**.
+La interfaz se llama **Nathpeando** (nombre a cambiar ? ) y el ejecutable `mando`, versión **1.2.1**.
 
 ## Características
 
@@ -10,10 +10,9 @@ La interfaz se llama **Nathpeando** y el ejecutable sigue siendo `mando`, versi�
 - Escaneo en vivo: conecta en cuanto detecta el mando.
 - Comprobación de estabilidad del enlace y del nodo HID durante varios segundos.
 - Detección de errores HID del driver `nintendo` en el kernel.
-- Lista de **mandos conocidos** por MAC, leyendo siempre el nombre actual de BlueZ: si renombras el mando, sigue apareciendo con su nombre nuevo.
+- Lista de **mandos conocidos** por MAC, leyendo siempre el nombre actual de Bluez
 - Prueba de botones y ejes con `evtest`; si Steam captura el mando, usa la interfaz `/dev/input/jsN` como respaldo.
 - Comando `fix-bt` para evitar que el adaptador Bluetooth USB entre en autosuspend.
-- Banner con máscara de Kamen Rider (color real/256 colores o monocromo).
 
 ## Requisitos
 
@@ -74,9 +73,6 @@ mando connect AA:BB:CC:DD:EE:FF
 mando test AA:BB:CC:DD:EE:FF 60
 mando info
 mando fix-bt
-```
-
-Extra para ver la máscara suelta (el banner ya la muestra automáticamente):
 
 ```bash
 mando rider
