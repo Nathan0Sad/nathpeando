@@ -1,0 +1,6 @@
+# Logs y estado local
+*.log
+mando.bak-*
+__pycache__/
+*.pyc
+.DS_Store

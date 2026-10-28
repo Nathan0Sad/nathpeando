@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Conectar mando
+Comment=Conecta y prueba mandos Bluetooth sin desemparejar
+Exec=mando
+Icon=input-gaming
+Terminal=true
+Categories=Utility;
+Keywords=bluetooth;mando;controller;gamepad;steam;
+StartupNotify=true

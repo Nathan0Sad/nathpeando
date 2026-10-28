@@ -1,0 +1,1577 @@
+#!/usr/bin/env bash
+# mando (Nathpeando) — Conectar, reparar y probar mandos Bluetooth en Linux
+#
+# Uso:
+#   mando                 Menú interactivo
+#   mando list            Lista mandos conocidos y su estado
+#   mando scan [seg]      Busca y conecta el primer mando que aparezca
+#   mando connect [MAC]   Conecta/reconecta sin desemparejar (si no hay MAC, pregunta)
+#   mando auto [seg]      Igual que scan
+#   mando test [MAC] [s]  Captura y resume botones/ejes (por defecto 60 s)
+#   mando rider [--mono]  Máscara de Kamen Rider (color o ASCII)
+#   mando info [MAC]      Estado, nodos y capacidades del mando
+#   mando fix-bt          Evita que el adaptador Bluetooth se suspenda
+#
+# Nunca borra emparejamientos: solo usa trust/connect y espera a que el
+# mando despierte. El escaneo es en vivo y conecta en cuanto lo detecta.
+#
+# No necesita root para Bluetooth: usa bluetoothctl como usuario.
+# Para leer /dev/input/event* pide permisos con pkexec solo si hace falta.
+
+set -uo pipefail
+
+APP_NAME="Nathpeando"
+APP_TAGLINE="Fix mandos Bluetooth"
+RIDER_HELPER_MARK="# rider-helper v1 (Nathpeando)"
+VERSION="1.2.1"
+BANNER_TITLE="N A T H P E A N D O"
+BANNER_SUBTITLE="Versión v$VERSION · $APP_TAGLINE"
+BANNER_TAGLINE="conectar, arreglar y jugar!"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mando"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+LOG="$STATE_DIR/mando.log"
+
+if [ -t 1 ]; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
+  C_CYN=$'\e[36m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+  C_DIM=$'\e[2m'
+  C_BRED=$'\e[91m'; C_BGRN=$'\e[92m'
+else
+  C_RED=; C_GRN=; C_YEL=; C_CYN=; C_BLD=; C_RST=
+  C_DIM=; C_BRED=; C_BGRN=
+fi
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG" 2>/dev/null || true; }
+msg() { printf '%s\n' "$*"; }
+ok()  { printf '%s\n' "${C_BLD}${C_GRN}$*${C_RST}"; }
+warn(){ printf '%s\n' "${C_YEL}$*${C_RST}"; }
+err() { printf '%s\n' "${C_BLD}${C_RED}$*${C_RST}" >&2; }
+
+hdr() {
+  local line
+  printf -v line '─%.0s' {1..54}
+  printf '\n  %s▸ %s%s\n  %s%s%s\n' \
+    "${C_BLD}${C_CYN}" "$*" "$C_RST" \
+    "$C_DIM" "$line" "$C_RST"
+}
+
+banner_text() {
+  local width="$1" indent="$2" center="${3:-0}" title subtitle safety
+  title="$BANNER_TITLE"
+  subtitle="$BANNER_SUBTITLE"
+  safety="$BANNER_TAGLINE"
+  printf '\n%*s%s%s%s\n' \
+    "$((indent + (width - ${#title}) / 2 + center))" '' \
+    "${C_BLD}${C_CYN}" "$title" "$C_RST"
+  printf '%*s%s%s%s\n' \
+    "$((indent + (width - ${#subtitle}) / 2 + center))" '' \
+    "$C_BLD" "$subtitle" "$C_RST"
+  printf '%*s%s%s%s\n' \
+    "$((indent + (width - ${#safety}) / 2 + center))" '' \
+    "$C_DIM" "$safety" "$C_RST"
+}
+
+render_rider_side() {
+  # Máscara a la izquierda y los textos del banner a la derecha.
+  # Pensado para terminales anchas pero de poca altura (por ejemplo 80x24).
+  local indent="${1:-0}" mode="${2:-}" art line i=0 title subtitle tagline tw toff goff
+  ensure_rider_helper || return 1
+  if [ "$mode" = "--mono" ]; then
+    art=$(python3 "$RIDER_HELPER" --mono 2>/dev/null) || return 1
+  else
+    art=$(python3 "$RIDER_HELPER" 2>/dev/null) || return 1
+  fi
+  [ -n "$art" ] || return 1
+  title="$BANNER_TITLE"
+  subtitle="$BANNER_SUBTITLE"
+  tagline="$BANNER_TAGLINE"
+  tw=${#subtitle}
+  toff=$(( (tw - ${#title}) / 2 ))
+  goff=$(( (tw - ${#tagline}) / 2 ))
+  while IFS= read -r line; do
+    i=$((i + 1))
+    case "$i" in
+      9)  printf '%*s%s  %*s%s%s%s\n' "$indent" '' "$line" "$toff" '' "${C_BLD}${C_CYN}" "$title" "$C_RST" ;;
+      11) printf '%*s%s  %s%s%s\n' "$indent" '' "$line" "$C_BLD" "$subtitle" "$C_RST" ;;
+      13) printf '%*s%s  %*s%s%s%s\n' "$indent" '' "$line" "$goff" '' "$C_DIM" "$tagline" "$C_RST" ;;
+      *)  printf '%*s%s\n' "$indent" '' "$line" ;;
+    esac
+  done <<<"$art"
+}
+
+render_rider() {
+  local indent="${1:-0}" mode="${2:-}" art line
+  ensure_rider_helper || return 1
+  if [ "$mode" = "--mono" ]; then
+    art=$(python3 "$RIDER_HELPER" --mono 2>/dev/null) || return 1
+  else
+    art=$(python3 "$RIDER_HELPER" 2>/dev/null) || return 1
+  fi
+  [ -n "$art" ] || return 1
+  while IFS= read -r line; do
+    printf '%*s%s\n' "$indent" '' "$line"
+  done <<<"$art"
+}
+
+banner() {
+  local cols rows colors indent mode=""
+  if [ ! -t 1 ]; then
+    printf '%s · v%s · %s\n' "$APP_NAME" "$VERSION" "$APP_TAGLINE"
+    return 0
+  fi
+  cols=$(tput cols 2>/dev/null || true)
+  case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+  rows=$(tput lines 2>/dev/null || true)
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  if [ "$cols" -lt 41 ]; then
+    printf '\n  %s%s%s %s· v%s%s\n' \
+      "$C_BLD" "$APP_NAME" "$C_RST" "$C_DIM" "$VERSION" "$C_RST"
+    return 0
+  fi
+
+  # La máscara ES el banner: a color si se puede; si no, la misma en ASCII.
+  colors=$(tput colors 2>/dev/null || true)
+  case "$colors" in ''|*[!0-9]*) colors=0 ;; esac
+  if [ "$colors" -lt 256 ] && [ "${COLORTERM:-}" != truecolor ] && [ "${COLORTERM:-}" != 24bit ]; then
+    mode="--mono"
+  fi
+
+  if [ "$rows" -lt 30 ] && [ "$cols" -ge 80 ]; then
+    # Terminal ancha y baja: máscara a la izquierda, textos a la derecha.
+    indent=$(( (cols - 80) / 2 ))
+    [ "$indent" -lt 0 ] && indent=0
+    if render_rider_side "$indent" "$mode"; then
+      return 0
+    fi
+  else
+    indent=$(( (cols - 41) / 2 ))
+    [ "$indent" -lt 0 ] && indent=0
+    if render_rider "$indent" "$mode"; then
+      banner_text 41 "$indent" 0
+      return 0
+    fi
+  fi
+
+  # Último recurso si Python no puede dibujar la máscara.
+  printf '\n  %s%s%s %s· v%s%s\n' \
+    "$C_BLD" "$APP_NAME" "$C_RST" "$C_DIM" "$VERSION" "$C_RST"
+}
+
+status_color() {
+  case "$1" in
+    conectado*) printf '%s' "$C_BGRN" ;;
+    *)          printf '%s' "$C_YEL" ;;
+  esac
+}
+
+print_controller_row() {
+  local num="$1" mac="$2" name="$3" st sc
+  st=$(controller_status "$mac")
+  st="${st//, / · }"
+  sc=$(status_color "$st")
+  printf '   %s%2d%s  %s%s%s\n' "$C_BLD" "$num" "$C_RST" "$C_BLD" "$name" "$C_RST"
+  printf '       %s%s%s  %s● %s%s\n' \
+    "$C_DIM" "$mac" "$C_RST" "$sc" "$st" "$C_RST"
+}
+
+strip_ansi() { sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
+norm_mac()   { printf '%s' "$1" | tr 'a-f' 'A-F'; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { err "Falta el programa '$1'. Instálalo y vuelve a intentar."; exit 1; }
+}
+
+bt_info() { bluetoothctl info "$1" 2>/dev/null | strip_ansi; }
+bt_field() {
+  # bt_field "<info>" Clave
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -n1
+}
+device_known() { bt_info "$1" | grep -q "^Device $1"; }
+
+device_display_name() {
+  # Nombre visible actual: primero el alias (renombrado por el usuario),
+  # luego el nombre del hardware.
+  local info="$1" name
+  name=$(bt_field "$info" Alias)
+  [ -z "$name" ] && name=$(bt_field "$info" Name)
+  printf '%s' "$name"
+}
+
+is_controller_name() {
+  case "$1" in
+    *Xbox*|*Pro\ Controller*|*DualSense*|*DualShock*|*Gamepad*|*Controller*|\
+    *8BitDo*|*HOSO*|*IG01*|*Joy-Con*|*Switch*|*Steam*) return 0 ;;
+  esac
+  return 1
+}
+
+is_controller_info() {
+  local info="$1" name icon class
+  name=$(device_display_name "$info")
+  icon=$(bt_field "$info" Icon)
+  class=$(bt_field "$info" Class)
+  case "$icon" in input-gaming) return 0 ;; esac
+  case "$class" in *0x00000508*|*0x00002508*) return 0 ;; esac
+  is_controller_name "$name"
+}
+
+controllers_list() {
+  # Salida: MAC<TAB>NOMBRE
+  # El nombre se lee siempre de BlueZ (Alias actual), así que un mando
+  # renombrado sigue apareciendo con el mismo MAC aunque su nombre cambie.
+  bluetoothctl devices 2>/dev/null | strip_ansi | while IFS= read -r line; do
+    case "$line" in
+      "Device "*)
+        local rest mac name info
+        rest=${line#Device }
+        mac=${rest%% *}
+        name=${rest#* }
+        [ "$name" = "$mac" ] && name=""
+        if is_controller_name "$name"; then
+          printf '%s\t%s\n' "$mac" "$name"
+        else
+          # Aunque el nombre no parezca de mando, comprobar icono/clase/HID.
+          info=$(bt_info "$mac")
+          if is_controller_info "$info"; then
+            name=$(device_display_name "$info")
+            printf '%s\t%s\n' "$mac" "${name:-?}"
+          fi
+        fi
+        ;;
+    esac
+  done
+}
+
+controller_status() {
+  # controller_status MAC
+  local mac="$1" info connected paired bonded trusted state
+  info=$(bt_info "$mac")
+  connected=$(bt_field "$info" Connected)
+  paired=$(bt_field "$info" Paired)
+  bonded=$(bt_field "$info" Bonded)
+  trusted=$(bt_field "$info" Trusted)
+  state="desconectado"
+  [ "$connected" = yes ] && state="conectado"
+  if [ "$bonded" = yes ]; then
+    state="$state, bonded"
+  else
+    state="$state, SIN bond"
+  fi
+  [ "$trusted" = yes ] && state="$state, trusted"
+  printf '%s' "$state"
+}
+
+find_nodes() {
+  # find_nodes MAC -> líneas NOMBRE<TAB>HANDLERS<TAB>SYSFS
+  python3 - "$1" <<'PY'
+import re, sys
+mac = sys.argv[1].lower()
+try:
+    data = open('/proc/bus/input/devices').read().strip()
+except OSError:
+    sys.exit(0)
+for block in data.split('\n\n'):
+    u = re.search(r'^U: Uniq=(\S+)', block, re.M)
+    if not u or u.group(1).lower() != mac:
+        continue
+    n = re.search(r'^N: Name="([^"]+)"', block, re.M)
+    h = re.search(r'^H: Handlers=(.+)$', block, re.M)
+    s = re.search(r'^S: Sysfs=(\S+)', block, re.M)
+    print('\t'.join([
+        n.group(1) if n else '?',
+        h.group(1).strip() if h else '',
+        s.group(1) if s else '',
+    ]))
+PY
+}
+
+print_nodes() {
+  local mac="$1" nodes name handlers sysfs evs hidid drv
+  nodes=$(find_nodes "$mac")
+  if [ -z "$nodes" ]; then
+    warn "  (sin nodo de entrada todavía)"
+    return 1
+  fi
+  while IFS=$'\t' read -r name handlers sysfs; do
+    [ -z "$name" ] && continue
+    evs=$(printf '%s' "$handlers" | tr ' ' ',')
+    printf '  %s•%s %s%s%s\n    %s%s%s\n' \
+      "$C_GRN" "$C_RST" "$C_BLD" "$name" "$C_RST" \
+      "$C_DIM" "$evs" "$C_RST"
+    hidid=$(printf '%s' "$sysfs" | grep -oE '0005:[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}\.[0-9A-Fa-f]+' | head -n1)
+    if [ -n "$hidid" ] && [ -r "/sys/bus/hid/devices/$hidid/uevent" ]; then
+      drv=$(grep -m1 '^DRIVER=' "/sys/bus/hid/devices/$hidid/uevent" | cut -d= -f2)
+      printf '    %sdriver:%s %s\n' "$C_DIM" "$C_RST" "${drv:-?}"
+    fi
+  done <<<"$nodes"
+  return 0
+}
+
+pick_event_node() {
+  # pick_event_node MAC -> /dev/input/eventN del mando (no teclado/ratón/IMU)
+  find_nodes "$1" | python3 -c '
+import sys
+best = None
+for line in sys.stdin.read().strip().splitlines():
+    parts = line.split("\t")
+    if len(parts) < 2:
+        continue
+    name, handlers = parts[0].lower(), parts[1]
+    if any(x in name for x in ("consumer control", "keyboard", "mouse", "imu", "motion", "touch")):
+        continue
+    ev = None
+    for h in handlers.split():
+        if h.startswith("event"):
+            ev = "/dev/input/" + h
+    if not ev:
+        continue
+    score = 0
+    if any(x in name for x in ("controller", "gamepad", "pad", "joystick")):
+        score += 10
+    if any(x in name for x in ("xbox", "pro controller", "dualsense", "dualshock")):
+        score += 5
+    if best is None or score > best[0]:
+        best = (score, ev, parts[0])
+print(best[1] if best else "")
+'
+}
+
+pick_js_node() {
+  # pick_js_node MAC -> /dev/input/jsN del mando (interfaz de joystick)
+  find_nodes "$1" | python3 -c '
+import sys
+for line in sys.stdin.read().strip().splitlines():
+    parts = line.split("\t")
+    if len(parts) < 2:
+        continue
+    name = parts[0].lower()
+    if any(x in name for x in ("consumer control", "keyboard", "mouse", "imu", "motion", "touch")):
+        continue
+    for h in parts[1].split():
+        if h.startswith("js"):
+            print("/dev/input/" + h)
+            raise SystemExit
+'
+}
+
+wait_for_hid() {
+  # wait_for_hid MAC SEGUNDOS — sondeo rápido (200 ms)
+  local mac="$1" secs="${2:-8}" i=0 max
+  max=$((secs * 5))
+  while [ "$i" -lt "$max" ]; do
+    if [ -n "$(find_nodes "$mac")" ]; then
+      return 0
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+ensure_scan_helper() {
+  # Crea un pequeño escáner con PTY: bluetoothctl solo vuelca sus líneas
+  # en tiempo real si cree que habla con una terminal.
+  [ "${SCAN_HELPER_READY:-0}" = 1 ] && return 0
+  SCAN_HELPER="$STATE_DIR/bt-scan.py"
+  cat >"$SCAN_HELPER" <<'PY'
+#!/usr/bin/env python3
+import os, pty, re, select, signal, sys, time
+
+secs = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
+
+def stop(signum, frame):
+    raise SystemExit
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bluetoothctl", ["bluetoothctl"])
+    os._exit(1)
+
+os.write(fd, b"scan on\n")
+ansi = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+start = time.time()
+try:
+    while time.time() - start < secs:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        text = ansi.sub("", data.decode(errors="replace")).replace("\r", "")
+        sys.stdout.write(text)
+        sys.stdout.flush()
+finally:
+    try:
+        os.write(fd, b"scan off\nquit\n")
+    except OSError:
+        pass
+    time.sleep(0.15)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done = pid
+        if done:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+PY
+  chmod +x "$SCAN_HELPER" 2>/dev/null || true
+  SCAN_HELPER_READY=1
+}
+
+ensure_rider_helper() {
+  # Máscara de Kamen Rider dibujada con Python: 41x22, color real o 256.
+  [ "${RIDER_HELPER_READY:-0}" = 1 ] && return 0
+  RIDER_HELPER="$STATE_DIR/rider.py"
+  if [ -f "$RIDER_HELPER" ] && grep -qF "$RIDER_HELPER_MARK" "$RIDER_HELPER" 2>/dev/null; then
+    RIDER_HELPER_READY=1
+    return 0
+  fi
+  cat >"$RIDER_HELPER.tmp" <<'PY'
+#!/usr/bin/env python3
+# rider-helper v1 (Nathpeando)
+"""Kamen Rider (Ichigo) para terminal.
+Uso: python3 rider.py [--mono]
+Mejor con terminal >= 41x22 y colores (truecolor o 256)."""
+import math, os, sys
+
+W, H, CX = 41, 44, 20          # 44 filas de píxeles = 22 filas de terminal
+
+# ---------- paleta (RGB) ----------
+G_LIGHT, G_DARK = (70, 200, 175), (20, 120, 105)
+GLOSS, EDGE     = (150, 238, 218), (8, 62, 58)
+SIL_L, SIL, SIL_D, SIL_D2 = (245, 246, 248), (205, 210, 215), (130, 136, 142), (92, 98, 104)
+RED_EDGE, RED_MID, RED_BRIGHT = (70, 8, 14), (140, 14, 26), (205, 32, 42)
+RED_LIGHT, HIGHLIGHT, EYE_RIM = (238, 95, 100), (255, 190, 190), (12, 70, 64)
+BLACK, BLACK2   = (10, 11, 14), (42, 47, 53)
+GEM, GEM_L      = (30, 200, 130), (190, 255, 215)
+
+def lerp(a, b, t):
+    t = max(0, min(1, t))
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+def px(x, y):
+    """Color del píxel (x, y) o None si es fondo. La simetría sale de dx."""
+    dx = abs(x - CX)
+
+    # antenas (forma de V)
+    if y <= 11 and abs(dx - (3 + (11 - y) * 0.55)) < 0.75:
+        return SIL_L if y % 4 else SIL_D
+
+    # silueta del casco (elipse)
+    n = (dx / 19.5) ** 2 + ((y - 26.5) / 17.2) ** 2
+    if n > 1:
+        return None
+
+    # mandíbula plateada con dientes en zigzag
+    lim = 14 - (y - 33) * 0.95
+    if y >= 33 and dx <= lim:
+        zig = 35 + abs((dx % 4) - 2) * 0.75
+        if abs(y - zig) < 0.6:
+            return SIL_D2
+        if dx > lim - 1 or n > 0.88 or (dx == 0 and y > 37):
+            return SIL_D
+        return lerp(SIL_L, SIL_D, (y - 33) / 10 * 0.6 + dx / 14 * 0.4)
+
+    # franja central plateada + gema verde
+    sw = 3 if y < 14 else 2
+    if y <= 32 and dx <= sw:
+        gd = math.hypot(dx, y - 21)
+        if gd <= 1.9:
+            return GEM_L if gd < 0.9 else GEM
+        if dx == sw:
+            return SIL_D
+        return lerp(SIL_L, SIL, dx / sw)
+
+    # ojos rojos (ligeramente inclinados)
+    ex = (dx - 9.6) + (y - 19) * 0.14
+    en = (ex / 5.6) ** 2 + ((y - 19) / 7.6) ** 2
+    if en <= 1.25:
+        if en > 1:    return EYE_RIM
+        if en > 0.72: return RED_EDGE
+        hl = math.hypot(dx - 11.8, y - 14.5)
+        if hl < 1.6:  return HIGHLIGHT
+        if hl < 2.6:  return RED_LIGHT
+        return lerp(RED_BRIGHT, RED_MID, en)
+
+    # rejillas negras bajo los ojos
+    if 28 <= y <= 32 and 4 <= dx <= 14 - (y - 28) * 0.9:
+        if y == 32:
+            return SIL_D
+        return BLACK2 if y % 2 == 0 else BLACK
+
+    # remaches plateados
+    if (dx, y) in {(16, 27), (16, 31)}:
+        return SIL_L
+
+    # borde oscuro del casco
+    if n > 0.88:
+        return EDGE
+    # brillo en la frente
+    if 12 <= y <= 16 and 6 <= dx <= 12 and n < 0.8:
+        return GLOSS
+    # verde con degradado
+    return lerp(G_LIGHT, G_DARK, n / 0.88)
+
+# ---------- salida a terminal ----------
+TRUE = os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
+RESET = "\033[0m"
+
+def to256(c):
+    r, g, b = c
+    if abs(r - g) < 10 and abs(g - b) < 10:
+        v = (r + g + b) // 3
+        if v < 8:   return 16
+        if v > 248: return 231
+        return 232 + round((v - 8) / 247 * 23)
+    return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
+
+def fg(c): return f"\033[38;2;{c[0]};{c[1]};{c[2]}m" if TRUE else f"\033[38;5;{to256(c)}m"
+def bg(c): return f"\033[48;2;{c[0]};{c[1]};{c[2]}m" if TRUE else f"\033[48;5;{to256(c)}m"
+
+RAMP = " .:-=+*#%@"
+
+def render(mono=False):
+    rows = []
+    for r in range(H // 2):
+        line = ""
+        for x in range(W):
+            top, bot = px(x, 2 * r), px(x, 2 * r + 1)
+            if top is None and bot is None:
+                line += " "
+            elif mono:
+                cs = [c for c in (top, bot) if c]
+                lum = sum(0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in cs) / len(cs)
+                line += RAMP[min(len(RAMP) - 1, int(lum / 256 * len(RAMP)))]
+            elif bot is None:
+                line += fg(top) + "▀" + RESET
+            elif top is None:
+                line += fg(bot) + "▄" + RESET
+            else:
+                line += fg(top) + bg(bot) + "▀" + RESET
+        rows.append(line)
+    return "\n".join(rows)
+
+if __name__ == "__main__":
+    print(render(mono="--mono" in sys.argv))
+PY
+  mv -f "$RIDER_HELPER.tmp" "$RIDER_HELPER" 2>/dev/null || return 1
+  chmod +x "$RIDER_HELPER" 2>/dev/null || true
+  RIDER_HELPER_READY=1
+}
+
+scan_running() {
+  [ -n "${SCAN_PID:-}" ] && kill -0 "$SCAN_PID" 2>/dev/null
+}
+
+scan_start() {
+  # scan_start SEGUNDOS — inicia un escaneo en segundo plano y vuelca en vivo
+  local secs="${1:-20}" i=0
+  case "$secs" in ''|*[!0-9]*) secs=20 ;; esac
+  scan_stop
+  ensure_scan_helper
+  SCAN_LOG=$(mktemp)
+  python3 "$SCAN_HELPER" "$secs" >"$SCAN_LOG" 2>&1 &
+  SCAN_PID=$!
+  SCAN_ACTIVE=1
+  # Esperar como máximo 1 s a que arranque la exploración
+  while [ "$i" -lt 10 ]; do
+    grep -q "Discovery started" "$SCAN_LOG" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+scan_stop() {
+  local pid="${SCAN_PID:-}" i=0
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    # Nunca colgarse esperando al helper
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    SCAN_PID=""
+  fi
+  if [ "${SCAN_ACTIVE:-0}" = 1 ]; then
+    timeout 2 bluetoothctl scan off >/dev/null 2>&1 || true
+    SCAN_ACTIVE=0
+  fi
+  if [ -n "${SCAN_LOG:-}" ]; then
+    rm -f "$SCAN_LOG"
+    SCAN_LOG=""
+  fi
+}
+
+scan_until() {
+  # scan_until MAC SEGUNDOS — vuelve en cuanto ve ese MAC (no espera al timeout)
+  local mac="$1" secs="${2:-25}" i=0 report_at
+  scan_start "$secs"
+  report_at=$((SECONDS + 5))
+  while scan_running; do
+    if grep -qE "\[(NEW|CHG)\] Device $mac( |$)" "$SCAN_LOG" 2>/dev/null; then
+      scan_stop
+      return 0
+    fi
+    if [ $((i % 5)) -eq 0 ] && bt_info "$mac" | grep -q "Connected: yes"; then
+      scan_stop
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$report_at" ]; then
+      printf '  Buscando...\n'
+      report_at=$((SECONDS + 5))
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  scan_stop
+  bt_info "$mac" | grep -q "Connected: yes"
+}
+
+scan_load_names() {
+  # scan_load_names — vuelca en SCAN_NAMES los nombres vistos (MAC -> nombre)
+  SCAN_NAMES=()
+  [ -n "${SCAN_LOG:-}" ] && [ -f "$SCAN_LOG" ] || return 0
+  local mac name
+  while IFS=$'\t' read -r mac name; do
+    [ -n "$mac" ] && SCAN_NAMES["$mac"]="$name"
+  done < <(awk '
+    /^\[NEW\] Device [0-9A-F:]+ / {
+      mac = $3
+      name = substr($0, index($0, mac) + length(mac) + 1)
+      if (name !~ /^(RSSI:|Name:|Alias:|Class:|Icon:|UUID|ManufacturerData|ServiceData|ServicesResolved:|Paired:|Connected:|Trusted:|Blocked:|TxPower:|Advertising|Modalias:|WakeAllowed:|LegacyPairing:|Battery)/)
+        names[mac] = name
+      next
+    }
+    /^\[CHG\] Device [0-9A-F:]+ (Name|Alias): / {
+      mac = $3
+      sub(/^\[CHG\] Device [0-9A-F:]+ (Name|Alias): /, "", $0)
+      names[mac] = $0
+    }
+    END { for (m in names) print m "\t" names[m] }
+  ' "$SCAN_LOG")
+}
+
+scan_find_connected() {
+  # scan_find_connected — deja en SCAN_FOUND_* un mando ya conectado
+  local line rest mac name info
+  while IFS= read -r line; do
+    case "$line" in
+      "Device "*)
+        rest=${line#Device }
+        mac=${rest%% *}
+        name=${rest#* }
+        [ "$name" = "$mac" ] && continue
+        info=$(bt_info "$mac")
+        if ! is_controller_name "$name" && ! is_controller_info "$info"; then
+          continue
+        fi
+        [ -n "$(find_nodes "$mac")" ] || continue
+        SCAN_FOUND_NAME=$(device_display_name "$info")
+        [ -z "$SCAN_FOUND_NAME" ] && SCAN_FOUND_NAME="$name"
+        SCAN_FOUND_MAC="$mac"
+        return 0
+        ;;
+    esac
+  done < <(bluetoothctl devices Connected 2>/dev/null | strip_ansi)
+  return 1
+}
+
+scan_find_first_controller() {
+  # scan_find_first_controller SEGUNDOS
+  # Deja el MAC y el nombre en SCAN_FOUND_MAC / SCAN_FOUND_NAME.
+  local secs="${1:-20}" mac info name report_at
+  local checked_conn=" "
+  scan_start "$secs"
+  report_at=$((SECONDS + 5))
+  while scan_running; do
+    local macs connected_macs
+    macs=$(grep -oE '\[(NEW|CHG)\] Device ([0-9A-F:]{17})' "$SCAN_LOG" 2>/dev/null \
+      | awk '!seen[$3]++ {print $3}')
+    scan_load_names
+    while IFS= read -r mac; do
+      [ -z "$mac" ] && continue
+      name="${SCAN_NAMES[$mac]:-}"
+      # Sin nombre todavía: esperar a que BlueZ lo resuelva.
+      [ -z "$name" ] && continue
+      # Si el nombre no parece de mando, comprobar icono/clase/HID.
+      if ! is_controller_name "$name"; then
+        info=$(bt_info "$mac")
+        is_controller_info "$info" || continue
+        name=$(device_display_name "$info")
+        [ -z "$name" ] && name="${SCAN_NAMES[$mac]:-mando}"
+      fi
+      SCAN_FOUND_NAME="$name"
+      [ -z "$SCAN_FOUND_NAME" ] && SCAN_FOUND_NAME="mando"
+      SCAN_FOUND_MAC="$mac"
+      scan_stop
+      return 0
+    done <<<"$macs"
+
+    # Si el mando se despertó y BlueZ lo conectó solo, no seguir esperando.
+    connected_macs=$(grep -oE '\[CHG\] Device ([0-9A-F:]{17}) Connected: yes' "$SCAN_LOG" 2>/dev/null \
+      | awk '!seen[$3]++ {print $3}')
+    while IFS= read -r mac; do
+      [ -z "$mac" ] && continue
+      case "$checked_conn" in *" $mac "*) continue ;; esac
+      checked_conn="$checked_conn$mac "
+      info=$(bt_info "$mac")
+      is_controller_info "$info" || continue
+      SCAN_FOUND_NAME=$(device_display_name "$info")
+      [ -z "$SCAN_FOUND_NAME" ] && SCAN_FOUND_NAME="mando"
+      SCAN_FOUND_MAC="$mac"
+      scan_stop
+      return 0
+    done <<<"$connected_macs"
+
+    if [ "$SECONDS" -ge "$report_at" ]; then
+      printf '  Buscando...\n'
+      report_at=$((SECONDS + 5))
+    fi
+    sleep 0.2
+  done
+  scan_stop
+  return 1
+}
+
+pair_device() {
+  # 0=ok, 2=AlreadyExists, 3=AuthenticationFailed, 4=not available, 1=otro
+  local mac="$1" out
+  out=$(timeout 30 bluetoothctl pair "$mac" 2>&1 | strip_ansi)
+  printf '%s\n' "$out" | tail -n4
+  case "$out" in
+    *"Pairing successful"*) return 0 ;;
+    *"AlreadyExists"*)      return 2 ;;
+    *"AuthenticationFailed"*) return 3 ;;
+    *"not available"*)      return 4 ;;
+    *"Failed to pair"*)     return 1 ;;
+    "")                     return 1 ;;
+    *)                      return 0 ;;
+  esac
+}
+
+connect_device() {
+  local mac="$1" out
+  out=$(timeout 15 bluetoothctl connect "$mac" 2>&1 | strip_ansi)
+  LAST_CONNECT_OUT="$out"
+  printf '%s\n' "$out" | tail -n3
+  case "$out" in
+    *"Connection successful"*|*"already connected"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+trust_device() { bluetoothctl trust "$1" >/dev/null 2>&1 || true; }
+
+link_ready() {
+  # Enlace conectado y con al menos un nodo de entrada
+  local mac="$1"
+  bt_info "$mac" | grep -q "Connected: yes" && [ -n "$(find_nodes "$mac")" ]
+}
+
+confirm_link_stable() {
+  # confirm_link_stable MAC [SEGUNDOS] — comprueba que no se cae sola
+  local mac="$1" secs="${2:-2}" i=0 max
+  case "$secs" in ''|*[!0-9]*) secs=2 ;; esac
+  max=$((secs * 2))
+  while [ "$i" -lt "$max" ]; do
+    link_ready "$mac" || return 1
+    sleep 0.5
+    i=$((i + 1))
+  done
+  link_ready "$mac"
+}
+
+bt_usb_dir() {
+  # Directorio USB del adaptador Bluetooth (QCA9377 u otro)
+  local d
+  for d in /sys/bus/usb/devices/*; do
+    [ -r "$d/idVendor" ] || continue
+    case "$(cat "$d/product" 2>/dev/null)" in
+      *Bluetooth*|*bluetooth*) printf '%s' "$d"; return 0 ;;
+    esac
+    case "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" in
+      04ca:3015) printf '%s' "$d"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+bt_usb_id() {
+  local d
+  d=$(bt_usb_dir) || return 1
+  printf '%s:%s' "$(cat "$d/idVendor" 2>/dev/null)" "$(cat "$d/idProduct" 2>/dev/null)"
+}
+
+bt_usb_power_control() {
+  local d
+  d=$(bt_usb_dir) || return 1
+  cat "$d/power/control" 2>/dev/null
+}
+
+warn_if_bt_autosuspend() {
+  local pc
+  pc=$(bt_usb_power_control 2>/dev/null || true)
+  if [ "$pc" = auto ]; then
+    warn "Aviso: el adaptador Bluetooth tiene autosuspend activo."
+    msg "Puede cortar el mando unos segundos después de conectar."
+    msg "Arrégialo con: mando fix-bt"
+  fi
+}
+
+try_connect_wait() {
+  local mac="$1"
+  connect_device "$mac" || true
+  if printf '%s\n' "${LAST_CONNECT_OUT:-}" | grep -qiE "br-connection-create-socket|not available|page timeout"; then
+    warn "El mando no responde. Enciéndelo o pulsa Home/A y reintenta."
+    return 1
+  fi
+  if bt_info "$mac" | grep -q "Connected: yes"; then
+    wait_for_hid "$mac" 8 && return 0
+  fi
+  warn "No se pudo abrir el enlace. Enciende el mando (pulsa Home o A) y reintenta."
+  return 1
+}
+
+hid_recent_errors() {
+  # hid_recent_errors "AAA-MM-DD HH:MM:SS" — timeouts HID del driver nintendo
+  local since="$1"
+  command -v journalctl >/dev/null 2>&1 || return 1
+  journalctl -b -k --no-pager --since "$since" 2>/dev/null \
+    | grep -qiE 'nintendo .*(timeout waiting for input report|joycon_enforce_subcmd_rate|dropped IMU reports)' 
+}
+
+success_report() {
+  local mac="$1" secs="${2:-3}" name since retry_since errs=0
+  trust_device "$mac"
+  since="${CONNECT_T0:-}"
+  [ -z "$since" ] && since=$(date '+%Y-%m-%d %H:%M:%S')
+  [ "$secs" -ge 3 ] 2>/dev/null && msg "Comprobando que el enlace sea estable (${secs}s)..."
+  if ! confirm_link_stable "$mac" "$secs"; then
+    errs=1
+  fi
+  if [ "$errs" = 0 ] && hid_recent_errors "$since"; then
+    errs=1
+    warn "El kernel registró timeouts de reportes HID durante la conexión."
+  fi
+  if [ "$errs" = 1 ]; then
+    warn "El enlace se cayó o dio errores justo después de conectar."
+    # Un solo intento de reconexión, sin desconectar ni borrar el vínculo.
+    if ! bt_info "$mac" | grep -q "Connected: yes"; then
+      connect_device "$mac" >/dev/null 2>&1 || true
+    fi
+    # Steam/kernel pueden reiniciar el HID una vez al empezar. Dar margen
+    # y exigir que después no haya errores nuevos ni caídas.
+    msg "Esperando a que termine el reinicio automático (4 s)..."
+    sleep 4
+    retry_since=$(date '+%Y-%m-%d %H:%M:%S')
+    if ! wait_for_hid "$mac" 8 || ! confirm_link_stable "$mac" 3 || hid_recent_errors "$retry_since"; then
+      err "El mando no se mantuvo conectado de forma estable."
+      msg "No se borró ningún vínculo. Enciende/despierta el mando y reintenta."
+      warn_if_bt_autosuspend
+      return 1
+    fi
+    warn "Hubo un reinicio inicial, pero el enlace ya quedó estable."
+  fi
+  name=$(device_display_name "$(bt_info "$mac")")
+  printf '\n  %s%s%s\n' "$C_BGRN" "$(printf '━%.0s' {1..50})" "$C_RST"
+  ok "  ✔ Mando conectado y estable: ${name:-$mac} ($mac)"
+  print_nodes "$mac"
+  printf '  %s%s%s\n' "$C_GRN" "$(printf '─%.0s' {1..50})" "$C_RST"
+  msg ""
+  msg "No se borró ningún vínculo."
+  warn_if_bt_autosuspend
+  msg "Steam debería detectarlo. Si no aparece, cierra Steam y ábrelo de nuevo."
+  return 0
+}
+
+cmd_connect() {
+  local mac="${1:-}" wait_secs="${2:-25}"
+  require bluetoothctl
+  if [ -z "$mac" ]; then
+    choose_controller || return 1
+    mac="$CHOSEN_MAC"
+  fi
+  case "$wait_secs" in ''|*[!0-9]*) wait_secs=25 ;; esac
+  mac=$(norm_mac "$mac")
+  CONNECT_T0=$(date '+%Y-%m-%d %H:%M:%S')
+  if ! device_known "$mac"; then
+    msg "Buscando $mac... (máx ${wait_secs}s)"
+    scan_until "$mac" "$wait_secs" || {
+      err "No se encontró $mac. Enciéndelo en modo emparejamiento."
+      return 1
+    }
+    sleep 0.2
+  fi
+
+  local info paired bonded connected
+  info=$(bt_info "$mac")
+  paired=$(bt_field "$info" Paired)
+  bonded=$(bt_field "$info" Bonded)
+  connected=$(bt_field "$info" Connected)
+  log "connect $mac paired=$paired bonded=$bonded connected=$connected"
+
+  # Ya conectado y con nodo: no tocar nada
+  if [ "$connected" = yes ] && [ -n "$(find_nodes "$mac")" ]; then
+    if success_report "$mac" 1; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # Conectado pero sin nodo: esperar sin desconectar ni borrar nada.
+  if [ "$connected" = yes ]; then
+    warn "Conectado pero sin nodo HID."
+    msg "Si el mando está dormido, pulsa Home/A ahora (6 s)..."
+    if wait_for_hid "$mac" 6; then
+      if success_report "$mac" 2; then
+        return 0
+      fi
+      return 1
+    fi
+    warn "Sigue sin nodo HID. No se tocó el enlace ni se borró el vínculo."
+    msg "Pulsa Home/A o apaga/enciende el mando; luego reintenta: mando connect $mac"
+    return 1
+  fi
+
+  # Vínculo incompleto: Paired sin Bonded. NO se borra nada.
+  if [ "$paired" = yes ] && [ "$bonded" != yes ]; then
+    warn "Vínculo incompleto (Paired sin Bonded). Probando sin desemparejar..."
+    trust_device "$mac"
+    if try_connect_wait "$mac" && success_report "$mac" 5; then
+      return 0
+    fi
+    err "El vínculo sigue incompleto y no apareció el nodo HID."
+    msg "No se borró el emparejamiento. Enciende/despierta el mando y vuelve a intentar."
+    return 1
+  fi
+
+  # Ya emparejado y bonded: confiar, conectar y esperar HID
+  if [ "$paired" = yes ] && [ "$bonded" = yes ]; then
+    trust_device "$mac"
+    if try_connect_wait "$mac" && success_report "$mac" 5; then
+      return 0
+    fi
+    err "Emparejado, pero el kernel no creó el nodo de entrada."
+    msg "No se borró nada. Enciende/despierta el mando y reintenta."
+    return 1
+  fi
+
+  # Sin emparejar: pair con reintentos, sin borrar vínculos
+  local attempt rc
+  for attempt in 1 2; do
+    msg "Emparejando (intento $attempt/2)..."
+    pair_device "$mac"; rc=$?
+    case $rc in
+      0) break ;;
+      2)
+        warn "BlueZ dice que el vínculo ya existe. Comprobando sin desemparejar..."
+        if [ -n "$(find_nodes "$mac")" ]; then
+          break
+        fi
+        trust_device "$mac"
+        if try_connect_wait "$mac" && success_report "$mac" 5; then
+          return 0
+        fi
+        err "El vínculo existente no creó el nodo HID."
+        msg "No se borró nada. Enciende/despierta el mando y reintenta."
+        return 1
+        ;;
+      3)
+        warn "Autenticación rechazada. Pon el mando en modo emparejamiento y desconéctalo de otros equipos."
+        sleep 1
+        ;;
+      4)
+        warn "El mando no está disponible; esperando a que se anuncie..."
+        scan_until "$mac" "$wait_secs" || { err "No se encontró el mando."; return 1; }
+        ;;
+      *) sleep 1 ;;
+    esac
+  done
+
+  if ! bt_info "$mac" | grep -q "Paired: yes"; then
+    err "No se pudo completar el emparejamiento."
+    msg "No se borró ningún vínculo existente."
+    return 1
+  fi
+  trust_device "$mac"
+  if try_connect_wait "$mac" && success_report "$mac" 5; then
+    return 0
+  fi
+  err "Emparejado, pero no se creó el nodo de entrada."
+  msg "No se borró nada. Enciende/despierta el mando y reintenta."
+  return 1
+}
+
+cmd_fix_bt() {
+  hdr "Evitar cortes del Bluetooth (autosuspend)"
+  local id pc tmp files_ok=1 f
+  id=$(bt_usb_id 2>/dev/null || true)
+  if [ -z "$id" ]; then
+    err "No encontré un adaptador Bluetooth USB."
+    return 1
+  fi
+  pc=$(bt_usb_power_control 2>/dev/null || true)
+  msg "Adaptador: $id"
+  for f in /etc/modprobe.d/btusb-no-autosuspend.conf \
+           /etc/tlp.d/50-bluetooth-mando.conf; do
+    [ -e "$f" ] || files_ok=0
+  done
+  if [ "$pc" = on ] && [ "$files_ok" = 1 ]; then
+    ok "Ya está desactivado y configurado de forma persistente."
+    msg "No hace falta hacer nada."
+    return 0
+  fi
+  if [ "$pc" = on ]; then
+    ok "Ahora mismo el autosuspend está desactivado."
+  else
+    warn "Ahora mismo está en '${pc:-?}'; el adaptador puede suspenderse y cortar el mando."
+  fi
+  msg "Se aplicará de forma persistente y reversible. Puede pedir tu contraseña."
+  if ! command -v pkexec >/dev/null 2>&1; then
+    err "Falta pkexec. Ejecuta el arreglo manualmente como root."
+    return 1
+  fi
+
+  tmp="$STATE_DIR/fix-bt.sh"
+  cat >"$tmp" <<'SH'
+#!/bin/bash
+set -u
+id="${1:-04ca:3015}"
+vid=${id%%:*}
+pid=${id##*:}
+
+cat > /etc/modprobe.d/btusb-no-autosuspend.conf <<'EOF'
+# Evita que btusb permita autosuspend: el mando Bluetooth se desconectaba
+# unos segundos despues de conectar. Reversible: borra este archivo.
+options btusb enable_autosuspend=0
+EOF
+chmod 644 /etc/modprobe.d/btusb-no-autosuspend.conf
+
+cat > /etc/tlp.d/50-bluetooth-mando.conf <<EOF
+# No autosuspender el adaptador Bluetooth $id.
+# Reversible: borra este archivo y ejecuta: tlp start
+USB_DENYLIST="$id"
+EOF
+chmod 644 /etc/tlp.d/50-bluetooth-mando.conf
+
+cat > /etc/udev/rules.d/99-bluetooth-no-autosuspend.rules <<EOF
+# No autosuspender el adaptador Bluetooth $id (mando).
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="$vid", ATTR{idProduct}=="$pid", ATTR{power/control}="on", ATTR{power/wakeup}="enabled"
+EOF
+chmod 644 /etc/udev/rules.d/99-bluetooth-no-autosuspend.rules
+command -v udevadm >/dev/null 2>&1 && udevadm control --reload-rules >/dev/null 2>&1 || true
+
+set_bt_on() {
+  local d
+  for d in /sys/bus/usb/devices/*; do
+    [ -r "$d/idVendor" ] || continue
+    if [ "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" = "$id" ]; then
+      echo on > "$d/power/control" 2>/dev/null || true
+      echo enabled > "$d/power/wakeup" 2>/dev/null || true
+    fi
+  done
+}
+
+set_bt_on
+TLP=$(command -v tlp 2>/dev/null || echo /usr/sbin/tlp)
+[ -x "$TLP" ] && "$TLP" start >/dev/null 2>&1 || true
+set_bt_on
+SH
+  chmod 700 "$tmp"
+  if ! pkexec bash "$tmp" "$id"; then
+    err "No se aplicó el cambio (¿cancelaste la autenticación?)."
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  ok "Autosuspend desactivado para $id."
+  msg "Para revertir:"
+  msg "  sudo rm /etc/modprobe.d/btusb-no-autosuspend.conf \\"
+  msg "          /etc/tlp.d/50-bluetooth-mando.conf \\"
+  msg "          /etc/udev/rules.d/99-bluetooth-no-autosuspend.rules"
+  msg "  sudo tlp start"
+  if [ "$(bt_usb_power_control 2>/dev/null || true)" = on ]; then
+    ok "Verificado: power/control=on."
+  else
+    warn "No pude verificar power/control=on; revisa con: mando info"
+  fi
+  return 0
+}
+
+ensure_readable() {
+  local node="$1"
+  [ -r "$node" ] && return 0
+  warn "Sin permiso de lectura en $node; aplicando ACL temporal..."
+  if command -v pkexec >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1; then
+    pkexec setfacl -m "u:$USER:rw" "$node" && [ -r "$node" ] && return 0
+  fi
+  err "No se pudo obtener permiso. Ejecuta: sudo setfacl -m u:$USER:rw $node"
+  return 1
+}
+
+summarize_evtest_log() {
+  # summarize_evtest_log ARCHIVO — resume botones y ejes de una captura de evtest
+  python3 - "$1" <<'PY'
+import re, sys, collections
+log = open(sys.argv[1], errors='replace').read()
+press = collections.Counter(); release = collections.Counter()
+ax = collections.defaultdict(lambda: [10**9, -10**9])
+for line in log.splitlines():
+    m = re.search(r'type (\d+) \(([^)]+)\), code (\d+) \(([^)]+)\), value (-?\d+)', line)
+    if not m:
+        continue
+    t, code, cn, val = int(m.group(1)), int(m.group(3)), m.group(4), int(m.group(5))
+    key = cn.split()[0] if cn else str(code)
+    if t == 1:
+        (press if val else release)[key] += 1
+    elif t == 3:
+        ax[key][0] = min(ax[key][0], val)
+        ax[key][1] = max(ax[key][1], val)
+
+print("\n=== BOTONES (pulsaciones / liberaciones) ===")
+if press or release:
+    for k in sorted(set(press) | set(release)):
+        print(f"  {k:22} press={press[k]:3}  release={release[k]:3}")
+    if any(press[k] != release[k] for k in set(press) | set(release)):
+        print("\n  (press y release distintos: algún botón quedó pulsado al empezar o al terminar)")
+else:
+    print("  (ninguno)")
+
+print("\n=== EJES (mín .. máx) ===")
+if ax:
+    for k in sorted(ax):
+        lo, hi = ax[k]
+        print(f"  {k:16} {lo:8} .. {hi:8}")
+else:
+    print("  (ninguno)")
+PY
+}
+
+cmd_test() {
+  local mac="${1:-}" secs="${2:-60}" node js=""
+  if [ -z "$mac" ]; then
+    choose_controller || return 1
+    mac="$CHOSEN_MAC"
+  fi
+  mac=$(norm_mac "$mac")
+  node=$(pick_event_node "$mac")
+  if [ -z "$node" ]; then
+    err "No hay nodo de entrada para $mac. Conéctalo primero con: mando connect $mac"
+    return 1
+  fi
+
+  # Si Steam (u otro programa) tiene el nodo abierto, puede estar capturándolo
+  # y evtest no recibiría nada. En ese caso usamos la interfaz js del mando.
+  local busy=0
+  if command -v fuser >/dev/null 2>&1 && fuser "$node" >/dev/null 2>&1; then
+    busy=1
+    js=$(pick_js_node "$mac")
+    if [ -n "$js" ]; then
+      ensure_readable "$js" || js=""
+    fi
+  fi
+  if [ -z "$js" ]; then
+    if [ "$busy" = 1 ]; then
+      warn "Otro programa (probablemente Steam) está usando $node y este mando no tiene interfaz js."
+      warn "Ciérralo o desactiva Steam Input para que la prueba reciba eventos."
+    fi
+    ensure_readable "$node" || return 1
+  fi
+
+  hdr "Prueba de $mac"
+  if [ -n "$js" ]; then
+    warn "Otro programa (probablemente Steam) está usando $node."
+    msg "Usando la interfaz de joystick: $js"
+  else
+    msg "Nodo: $node"
+  fi
+  msg "Durante ${secs}s pulsa botones, mueve sticks y cruceta."
+  msg "Empieza en 3..."
+  sleep 1; msg "2..."; sleep 1; msg "1..."; sleep 1
+
+  local tmp n caps
+  tmp="$STATE_DIR/last-test.log"
+  if [ -n "$js" ]; then
+    caps="$STATE_DIR/last-test-caps.log"
+    timeout 2 evtest "$node" 2>&1 | sed -n '/Supported events:/,/Properties:/p' >"$caps" 2>/dev/null || true
+    timeout "$secs" python3 - "$js" "$secs" "$caps" "$tmp" <<'PY'
+import os, re, select, struct, sys, time
+js_path, secs, caps_path, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+keys, axes = [], []
+for line in open(caps_path, errors='replace'):
+    m = re.search(r'Event code (\d+) \((BTN_[^)]+)\)', line)
+    if m:
+        keys.append((int(m.group(1)), m.group(2)))
+    m = re.search(r'Event code (\d+) \((ABS_[^)]+)\)', line)
+    if m:
+        axes.append((int(m.group(1)), m.group(2)))
+keys.sort(); axes.sort()
+key_by_idx = {i: item for i, item in enumerate(keys)}
+abs_by_idx = {i: item for i, item in enumerate(axes)}
+fmt = 'IhBB'
+size = struct.calcsize(fmt)
+fd = os.open(js_path, os.O_RDONLY | os.O_NONBLOCK)
+start = time.time()
+with open(out_path, 'w') as out:
+    try:
+        while time.time() - start < secs:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if not r:
+                continue
+            try:
+                data = os.read(fd, size * 256)
+            except BlockingIOError:
+                continue
+            for i in range(0, len(data) - size + 1, size):
+                _, val, typ, num = struct.unpack(fmt, data[i:i+size])
+                if typ & 0x80:  # estado inicial al abrir el dispositivo
+                    continue
+                if typ & 0x01 and num in key_by_idx:
+                    code, name = key_by_idx[num]
+                    out.write(f"Event: time {time.time():.6f}, type 1 (EV_KEY), code {code} ({name}), value {1 if val else 0}\n")
+                elif typ & 0x02 and num in abs_by_idx:
+                    code, name = abs_by_idx[num]
+                    out.write(f"Event: time {time.time():.6f}, type 3 (EV_ABS), code {code} ({name}), value {val}\n")
+    finally:
+        os.close(fd)
+PY
+  else
+    timeout "$secs" evtest "$node" >"$tmp" 2>&1 || true
+  fi
+  n=$(grep -c "Event: time" "$tmp" 2>/dev/null || true)
+  n=${n:-0}
+
+  if [ "$n" -eq 0 ]; then
+    warn "No llegó ningún evento. ¿Estaba el mando despierto y pulsaste algo?"
+    warn "Registro vacío guardado en: $tmp"
+    return 1
+  fi
+
+  summarize_evtest_log "$tmp"
+
+  msg ""
+  ok "Eventos capturados: $n"
+  msg "Registro completo: $tmp"
+}
+
+cmd_info() {
+  local mac="${1:-}" info
+  if [ -z "$mac" ]; then
+    cmd_list
+    return 0
+  fi
+  mac=$(norm_mac "$mac")
+  info=$(bt_info "$mac")
+  if ! printf '%s\n' "$info" | grep -q "^Device $mac"; then
+    err "No conozco el mando $mac."
+    return 1
+  fi
+  hdr "Mando $mac"
+  printf '%s\n' "$info" | grep -E "Name:|Alias:|Class:|Icon:|Paired:|Bonded:|Trusted:|Connected:|Modalias:" | sed 's/^[[:space:]]*/  /'
+  msg ""
+  print_nodes "$mac" || true
+  local node pc
+  pc=$(bt_usb_power_control 2>/dev/null || true)
+  if [ -n "$pc" ]; then
+    msg ""
+    msg "Adaptador Bluetooth: power/control=$pc"
+    [ "$pc" = auto ] && warn "Autosuspend activo; puede cortar el mando. Usa: mando fix-bt"
+  fi
+  node=$(pick_event_node "$mac")
+  if [ -n "$node" ]; then
+    if [ -r "$node" ]; then
+      msg ""
+      msg "Capacidades ($node):"
+      timeout 2 evtest "$node" 2>&1 | sed -n '/Supported events:/,/Properties:/p' | sed 's/^/  /' | head -70
+    else
+      msg ""
+      warn "Sin permiso para leer $node (usa 'mando test' para aplicarlo)."
+    fi
+  fi
+}
+
+cmd_list() {
+  local lines mac name st nodes sc
+  lines=$(controllers_list)
+  hdr "Mandos Bluetooth conocidos"
+  if [ -z "$lines" ]; then
+    warn "  No hay mandos Bluetooth conocidos."
+    return 1
+  fi
+  printf '  %s  %-18s %-32s %s%s\n' "$C_DIM" "MAC" "NOMBRE" "ESTADO" "$C_RST"
+  while IFS=$'\t' read -r mac name; do
+    [ -z "$mac" ] && continue
+    st=$(controller_status "$mac")
+    st="${st//, / · }"
+    sc=$(status_color "$st")
+    nodes=$(find_nodes "$mac" | wc -l)
+    printf '  %s●%s %-18s %-32s %s%s%s' \
+      "$sc" "$C_RST" "$mac" "${name:0:32}" "$sc" "$st" "$C_RST"
+    if [ "$nodes" -eq 1 ]; then
+      printf '  %s· 1 nodo%s' "$C_DIM" "$C_RST"
+    elif [ "$nodes" -gt 1 ]; then
+      printf '  %s· %s nodos%s' "$C_DIM" "$nodes" "$C_RST"
+    fi
+    printf '\n'
+  done <<<"$lines"
+}
+
+choose_controller() {
+  # Deja el MAC elegido en CHOSEN_MAC
+  local lines i opt mac name
+  lines=$(controllers_list)
+  if [ -z "$lines" ]; then
+    err "No hay mandos conocidos. Usa 'mando scan' para buscar uno nuevo."
+    return 1
+  fi
+  hdr "Elige un mando"
+  local -a macs=() names=()
+  i=1
+  while IFS=$'\t' read -r mac name; do
+    [ -z "$mac" ] && continue
+    macs+=("$mac"); names+=("$name")
+    print_controller_row "$i" "$mac" "$name"
+    i=$((i + 1))
+  done <<<"$lines"
+  printf '\n   %s0%s  Volver\n' "$C_DIM" "$C_RST"
+  read -rp "  Número › " opt || return 1
+  [ "$opt" = "0" ] && return 1
+  case "$opt" in
+    ''|*[!0-9]*) err "Opción no válida."; return 1 ;;
+  esac
+  if [ "$opt" -lt 1 ] || [ "$opt" -gt "${#macs[@]}" ]; then
+    err "Opción fuera de rango."; return 1
+  fi
+  CHOSEN_MAC="${macs[$((opt - 1))]}"
+  return 0
+}
+
+cmd_scan() {
+  local secs="${1:-20}" mac name
+  case "$secs" in ''|*[!0-9]*) secs=20 ;; esac
+
+  # Si ya hay un mando conectado, no perder tiempo escaneando.
+  if scan_find_connected; then
+    mac="$SCAN_FOUND_MAC"
+    name="$SCAN_FOUND_NAME"
+    hdr "Mando ya conectado"
+    ok "Detectado: $name ($mac)"
+    msg "Si querías buscar otro mando, apaga/desconecta este primero."
+    cmd_connect "$mac" 25
+    return
+  fi
+
+  hdr "Buscando mando (máx ${secs}s)"
+  msg "Enciende el mando (y ponlo en emparejamiento si es nuevo)."
+  msg "Conecto en cuanto aparezca; no hace falta esperar al final."
+  if ! scan_find_first_controller "$secs"; then
+    warn "No apareció ningún mando en ${secs}s."
+    msg "Revisa que esté encendido, en modo emparejamiento y cerca del portátil."
+    return 1
+  fi
+  mac="$SCAN_FOUND_MAC"
+  name="$SCAN_FOUND_NAME"
+  msg ""
+  ok "Detectado: $name ($mac)"
+  cmd_connect "$mac" 25
+}
+
+cmd_auto() {
+  cmd_scan "${1:-20}"
+}
+
+cmd_rider() {
+  local mode="" cols rows colors indent
+  case "${1:-}" in
+    "")            ;;
+    --mono|-m)     mode="--mono" ;;
+    *)             err "Uso: mando rider [--mono]"; return 1 ;;
+  esac
+
+  # Sin terminal (tubería) se usa la versión monocroma, legible en texto plano.
+  if [ ! -t 1 ]; then
+    render_rider 0 --mono
+    return 0
+  fi
+
+  cols=$(tput cols 2>/dev/null || true)
+  case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+  rows=$(tput lines 2>/dev/null || true)
+  case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
+  colors=$(tput colors 2>/dev/null || true)
+  case "$colors" in ''|*[!0-9]*) colors=0 ;; esac
+
+  if [ "$cols" -lt 41 ]; then
+    err "La máscara necesita al menos 41 columnas de ancho."
+    return 1
+  fi
+
+  if [ "$mode" != "--mono" ] &&
+     { [ "$colors" -lt 256 ] && [ "${COLORTERM:-}" != truecolor ] && [ "${COLORTERM:-}" != 24bit ]; }; then
+    warn "Terminal sin 256 colores: usando máscara monocroma."
+    mode="--mono"
+  fi
+
+  if [ "$rows" -lt 30 ] && [ "$cols" -ge 80 ]; then
+    # Máscara a la izquierda y textos a la derecha: cabe en 80x24.
+    indent=$(( (cols - 80) / 2 ))
+    [ "$indent" -lt 0 ] && indent=0
+    printf '\n'
+    render_rider_side "$indent" "$mode" || {
+      err "No se pudo generar la máscara de Kamen Rider."
+      return 1
+    }
+    return 0
+  fi
+
+  indent=$(( (cols - 41) / 2 ))
+  [ "$indent" -lt 0 ] && indent=0
+  printf '\n'
+  render_rider "$indent" "$mode" || {
+    err "No se pudo generar la máscara de Kamen Rider."
+    return 1
+  }
+  banner_text 41 "$indent" 0
+}
+
+menu() {
+  local opt
+  banner
+  while true; do
+    hdr "Mando Bluetooth"
+    local lines i mac name
+    lines=$(controllers_list)
+    if [ -n "$lines" ]; then
+      msg "  Mandos conocidos:"
+      i=1
+      local -a macs=() names=()
+      while IFS=$'\t' read -r mac name; do
+        [ -z "$mac" ] && continue
+        macs+=("$mac"); names+=("$name")
+        print_controller_row "$i" "$mac" "$name"
+        i=$((i + 1))
+      done <<<"$lines"
+      MENU_MACS=("${macs[@]}")
+    else
+      warn "  No hay mandos conocidos."
+      MENU_MACS=()
+    fi
+    printf '\n  %s%s%s\n' "$C_DIM" "$(printf '─%.0s' {1..54})" "$C_RST"
+    printf '   %s%ss%s  Buscar y conectar un mando nuevo\n' "$C_BLD" "$C_BGRN" "$C_RST"
+    printf '   %s%st%s  Probar un mando\n' "$C_BLD" "$C_BGRN" "$C_RST"
+    printf '   %s%sf%s  Evitar cortes del Bluetooth (autosuspend)\n' "$C_BLD" "$C_BGRN" "$C_RST"
+    printf '   %s%sq%s  Salir\n\n' "$C_BLD" "$C_YEL" "$C_RST"
+    read -rp "  Opción › " opt || return 0
+    case "$opt" in
+      q|Q) return 0 ;;
+      s|S) cmd_scan 20 ;;
+      t|T) choose_controller && cmd_test "$CHOSEN_MAC" 60 ;;
+      f|F) cmd_fix_bt ;;
+      ''|*[!0-9]*) err "Opción no válida." ;;
+      *)
+        if [ "$opt" -ge 1 ] && [ "$opt" -le "${#MENU_MACS[@]}" ]; then
+          cmd_connect "${MENU_MACS[$((opt - 1))]}"
+        else
+          err "Opción fuera de rango."
+        fi
+        ;;
+    esac
+    printf '\n'
+    read -rp "  Pulsa Enter para continuar..." _ || return 0
+  done
+}
+
+usage() {
+  [ "${1:-}" = "--no-banner" ] || banner
+  hdr "Uso"
+  cat <<EOF
+  mando                 Menú interactivo
+  mando list            Lista mandos conocidos y su estado
+  mando scan [seg]      Busca y conecta el primer mando que aparezca
+  mando connect [MAC]   Conecta/reconecta un mando (sin borrar el vínculo)
+  mando auto [seg]      Igual que scan
+  mando test [MAC] [s]  Captura y resume botones/ejes (defecto 60 s)
+  mando rider [--mono]  Muestra la máscara de Kamen Rider (color o ASCII)
+  mando info [MAC]      Estado, nodos y capacidades
+  mando fix-bt          Evita que el adaptador Bluetooth se suspenda
+EOF
+  hdr "Cómo funciona"
+  cat <<EOF
+  El escaneo es en vivo: en cuanto ve el mando, deja de escanear y conecta.
+  Nunca se borra ningún emparejamiento: solo se usa trust/connect.
+  Si el vínculo está incompleto, la herramienta prueba a reconectar y te pide
+  despertar el mando; no lo desempareja.
+
+  Antes de decir que todo va bien, comprueba que el enlace y el nodo de entrada
+  siguen estables unos segundos. Si el adaptador tiene autosuspend activo,
+  avisa y ofrece 'mando fix-bt' (persistente y reversible con TLP/modprobe;
+  también crea una regla udev si hace falta).
+
+  Si Steam está abierto y captura el mando, 'mando test' usa la
+  interfaz /dev/input/jsN como respaldo.
+EOF
+  hdr "Registro"
+  msg "  $LOG"
+}
+
+CHOSEN_MAC=""
+MENU_MACS=()
+SCAN_PID=""
+SCAN_LOG=""
+SCAN_ACTIVE=0
+SCAN_HELPER_READY=0
+SCAN_HELPER=""
+RIDER_HELPER_READY=0
+RIDER_HELPER=""
+SCAN_FOUND_MAC=""
+SCAN_FOUND_NAME=""
+LAST_CONNECT_OUT=""
+CONNECT_T0=""
+declare -A SCAN_NAMES=()
+
+trap 'scan_stop' EXIT
+
+require bluetoothctl
+require python3
+case "${1:-}" in
+  ""|menu)          menu ;;
+  list|ls)          cmd_list ;;
+  scan)             cmd_scan "${2:-20}" ;;
+  connect|conectar) cmd_connect "${2:-}" "${3:-25}" ;;
+  auto)             cmd_auto "${2:-20}" ;;
+  test|probar)      cmd_test "${2:-}" "${3:-60}" ;;
+  rider|logo|mascara) cmd_rider "${2:-}" ;;
+  info)             cmd_info "${2:-}" ;;
+  fix-bt|fixbt)     cmd_fix_bt ;;
+  -h|--help|help)   usage ;;
+  -v|--version)     echo "mando $VERSION" ;;
+  *)                err "Orden desconocida: $1"; usage --no-banner; exit 1 ;;
+esac
